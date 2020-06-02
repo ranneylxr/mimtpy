@@ -77,7 +77,7 @@ def find_HDFEOS_fullname(datadir):
     
 def find_nearest_date(datadir,date):
     """get the date close to the given date"""
-    datafile = find_timeseries(datadir)
+    datafile = find_HDFEOS_fullname(datadir)
     completion_status = os.system(seperate_str_byspace(['info.py', datafile, '--date', '>', 'date_list.txt']))
     if completion_status == 1:
         print('error when runing info.py')
@@ -96,16 +96,18 @@ def find_nearest_date(datadir,date):
                 date2 = dates
     return date2.strip()
 
-def find_start_end_date(datadir,inps):
+def find_start_end_date(datadir,startDate,endDate):
     """find the startdate and enddate of each track"""   
-    if not inps.startDate:
-        startdate2 = inps.startDate
-    if not inps.endDate:
-        enddate2 = inps.endDate
-    if inps.startDate:
-        startdate2 = find_nearest_date(datadir,inps.startDate)
-    if inps.endDate:
-        enddate2 = find_nearest_date(datadir,inps.endDate)
+    if startDate == 'None':
+        startdate2 = startDate
+    else:
+        startdate2 = find_nearest_date(datadir,startDate)
+    
+    if endDate == 'None':
+        enddate2 = endDate
+    else:
+        enddate2 = find_nearest_date(datadir,endDate)
+    
     return startdate2,enddate2
 
 def check_X_Y_step(folders):
@@ -229,3 +231,150 @@ def find_timeseries_horzvert(datadir):
         if len(file)>len(datafile):
             datafile = file
     return datafile
+
+def llh2xy(llh,origin):
+    """Converts from longitude and latitude to local coorindates
+      given an origin.  llh (lon; lat; height) and origin should
+      be in decimal degrees. Note that heights are ignored and
+      that xy is in km"""
+    # llh is 2*N matrix, N is the number of points. the first line is longitude and the second line is latitude
+    # orgion is 1*2 matrix,the order is longitude and latitude
+    #Set ellipsoid constants (WGS84)
+    a=6378137.0
+    e=0.08209443794970
+
+    #Convert to radians
+    llh=llh * np.pi/180
+    origin=origin * np.pi/180
+
+    #Do the projection
+
+    z=llh[1,:]!=0
+
+    dlambda=llh[0,z]-origin[0]
+
+    M=a*((1-e**2/4-3*(e**4)/64-5*(e**6)/256)*llh[1,z] - (3*(e**2)/8+3*(e**4)/32+45*(e**6)/1024)*np.sin(2*llh[1,z]) + (15*(e**4)/256 +45*(e**6)/1024)*np.sin(4*llh[1,z]) - (35*(e**6)/3072)*np.sin(6*llh[1,z]))
+
+    M0=a*((1-e**2/4-3*(e**4)/64-5*(e**6)/256)*origin[1] - (3*(e**2)/8+3*(e**4)/32+45*(e**6)/1024)*np.sin(2*origin[1]) + (15*(e**4)/256 +45*(e**6)/1024)*np.sin(4*origin[1]) - (35*(e**6)/3072)*np.sin(6*origin[1]))
+   
+    N=a/np.sqrt(1-e**2*np.sin(llh[1,z])**2)
+    E=dlambda*np.sin(llh[1,z])
+
+    xy = np.zeros((2,len(dlambda)),dtype=float)
+    xy[0,z]=N*(1 / np.tan(llh[1,z]))*np.sin(E)
+    xy[1,z]=M-M0+N*(1 / np.tan(llh[1,z]))*(1-np.cos(E))
+
+    #Handle special case of latitude = 0
+
+    dlambda=llh[0,~z]-origin[0]
+    xy[0,~z]=a*dlambda
+    xy[1,~z]=-M0
+
+    #Convert to km
+   
+    xy=xy/1000
+ 
+    return xy
+
+def calculate_LOS_value(inc,head,north_disp,east_disp,up_disp):
+    # calculate LOS
+    #Project displacement from LOS to Horizontal and Vertical components
+    #    math for 3D: cos(theta)*Uz - cos(alpha)*sin(theta)*Ux + sin(alpha)*sin(theta)*Uy = Ulos
+    #    math for 2D: cos(theta)*Uv - sin(alpha-az)*sin(theta)*Uh = Ulos   #Uh_perp = 0.0
+    """inc is 1*1 value, head is 1*1 value,north_disp/east_disp/up_disp is n*1 matrix
+        positive value means north/east/up"""
+    inc_angle = inc
+    head_angle = head
+    
+    az_angle = 90 
+    inc_angle *= np.pi/180.
+
+    # heading angle
+    if head_angle < 0.:
+        head_angle += 360.
+    head_angle *= np.pi/180.
+
+    # construct design matrix
+    A_up = np.cos(inc_angle)
+    A_north = np.sin(inc_angle) * np.sin(head_angle)
+    A_east = np.sin(inc_angle) * np.cos(head_angle)
+    
+    # LOS
+    los_sim = up_disp * A_up + north_disp * A_north - east_disp * A_east
+
+    return los_sim
+
+def read_template(fname, delimiter='=', print_msg=True):
+    """Reads the template file into a python dictionary structure.
+    Parameters: fname : str
+                    full path to the template file
+                delimiter : str
+                    string to separate the key and value
+                print_msg : bool
+                    print message or not
+    Returns:    template_dict : dict
+                    file content
+    Examples:
+        tmpl = read_template(KyushuT424F610_640AlosA.template)
+        tmpl = read_template(R1_54014_ST5_L0_F898.000.pi, ':')
+        from mintpy.defaults.auto_path import isceAutoPath
+        tmpl = read_template(isceAutoPath, print_msg=False)
+    """
+    template_dict = {}
+    plotAttributeDict = {}
+    insidePlotObject = False
+    plotAttributes = []
+    # the below logic for plotattributes object can be made much more simple
+    # if we assume that any plot attribute coming after a > belongs to the
+    # same object. Must Ask Falk and Yunjung if we can assume this to eliminate
+    # all these conditionals
+
+    if os.path.isfile(fname):
+        f = open(fname, 'r')
+        lines = f.readlines()
+    elif isinstance(fname, str):
+        lines = fname.split('\n')
+
+    for line in lines:
+        line = line.strip()
+        # split on the 1st occurrence of delimiter
+        c = [i.strip() for i in line.split(delimiter, 1)]
+        if len(c) < 2 or line.startswith(('%', '#')):
+            if line.startswith(">"):
+                plotAttributeDict = {}
+                insidePlotObject = True
+            # otherwise, if previously inside attributes object, we are now outside
+            # unless the line is a comment
+            elif insidePlotObject and not line.startswith('%') and not line.startswith('#'):
+                # just came from being inside plot object, but now we are outside
+                insidePlotObject = False
+                plotAttributes.append(plotAttributeDict)
+            next  # ignore commented lines or those without variables
+        else:
+            atrName = c[0]
+            atrValue = str.replace(c[1], '\n', '').split("#")[0].strip()
+            atrValue = os.path.expanduser(atrValue)
+            atrValue = os.path.expandvars(atrValue)
+
+            if insidePlotObject:
+                if is_plot_attribute(atrName):
+                    plotAttributeDict[atrName] = atrValue
+                else:
+                    # just came from being inside plot object, but now we are outside
+                    insidePlotObject = False
+                    plotAttributes.append(plotAttributeDict)
+                    template_dict[atrName] = atrValue
+
+            elif atrValue != '':
+                template_dict[atrName] = atrValue
+    if os.path.isfile(fname):
+        f.close()
+
+    # what if no \n at end of file? write out last plot attributes dict
+    if insidePlotObject:
+        plotAttributes.append(plotAttributeDict)
+
+    if len(plotAttributes) > 0:
+        template_dict["plotAttributes"] = json.dumps(plotAttributes)
+
+    return template_dict
